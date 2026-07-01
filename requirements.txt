@@ -1,0 +1,13 @@
+opencv-python
+pandas
+torch
+cellpose
+dominate
+wandb
+huggingface_hub
+timm
+albumentations
+scikit-learn
+transformers
+tensorflow
+sentencepiece
