@@ -1,3 +1,7 @@
 /data
 /format-data
 /results
+/checkpoints
+/logs
+*.sh
+/submissions

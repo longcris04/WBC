@@ -17,6 +17,8 @@ test.py / inference.py normalize identically.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import random
 from pathlib import Path
 
@@ -26,6 +28,29 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.model_selection import StratifiedKFold
+
+
+@contextlib.contextmanager
+def _suppress_c_stderr():
+    """Silence libjpeg/OpenCV C-level warnings (e.g. 'Corrupt JPEG data:
+    N extraneous bytes before marker ...') for slightly malformed but still
+    decodable JPEGs. Only the C-level fd 2 is muted, briefly, around the decode
+    call — Python-level stderr (tqdm, real tracebacks) is untouched."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
+def imread_color(path):
+    """cv2.imread as BGR, without the noisy libjpeg stderr warnings."""
+    with _suppress_c_stderr():
+        return cv2.imread(path, cv2.IMREAD_COLOR)
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -129,7 +154,7 @@ class WBCDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        img = cv2.imread(row["path"], cv2.IMREAD_COLOR)
+        img = imread_color(row["path"])
         if img is None:
             raise FileNotFoundError(f"Cannot read image: {row['path']}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -182,7 +207,7 @@ def compute_channel_stats(df: pd.DataFrame, img_size: int = 224,
     sq = np.zeros(3, dtype=np.float64)
     count = 0
     for p in sub["path"]:
-        img = cv2.imread(p, cv2.IMREAD_COLOR)
+        img = imread_color(p)
         if img is None:
             continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
