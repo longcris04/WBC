@@ -33,11 +33,13 @@ MODEL_ZOO = {
     "deit_small":      "deit_small_patch16_224",
     "swin_tiny":       "swin_tiny_patch4_window7_224",
     "swin_small":      "swin_small_patch4_window7_224",
+    "swin_base":       "swin_base_patch4_window7_224",
+    "swin_large":      "swin_large_patch4_window7_224",
 }
 
 # models that require a fixed 224x224 input
 FIXED_224 = {"vit_tiny", "vit_small", "vit_base", "deit_small",
-             "swin_tiny", "swin_small"}
+             "swin_tiny", "swin_small", "swin_base", "swin_large"}
 
 
 def list_models():

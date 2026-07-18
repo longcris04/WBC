@@ -227,13 +227,34 @@ def compute_channel_stats(df: pd.DataFrame, img_size: int = 224,
 # --------------------------------------------------------------------------- #
 # Class imbalance helpers
 # --------------------------------------------------------------------------- #
-def compute_class_weights(df: pd.DataFrame) -> torch.Tensor:
-    """Inverse-frequency weights (normalized to mean 1) for CrossEntropyLoss."""
+def compute_class_weights(df: pd.DataFrame, scheme: str = "inv") -> torch.Tensor:
+    """Class weights (normalized to mean 1) for CrossEntropyLoss.
+
+    ``scheme`` controls how aggressively rare classes are up-weighted:
+      * ``"inv"``   inverse frequency  w ∝ 1/n  (sharpest; on extreme imbalance a
+                    class with a handful of samples gets a huge weight and the
+                    model can collapse toward it).
+      * ``"sqrt"``  w ∝ 1/sqrt(n)  (milder).
+      * ``"log"``   inverse log-frequency  w ∝ 1/log1p(n)  (smoothest; ``log1p``
+                    stays finite even for a class absent from a fold, n=1).
+      * ``"effnum"`` effective-number weighting (Cui et al. 2019), beta=0.999.
+    """
     counts = np.ones(NUM_CLASSES, dtype=np.float64)
     vc = df["labels"].map(CLASS_TO_IDX).value_counts()
     for idx, n in vc.items():
         counts[int(idx)] = n
-    w = counts.sum() / (NUM_CLASSES * counts)
+    if scheme == "inv":
+        w = counts.sum() / (NUM_CLASSES * counts)
+    elif scheme == "sqrt":
+        w = 1.0 / np.sqrt(counts)
+    elif scheme == "log":
+        w = 1.0 / np.log1p(counts)
+    elif scheme == "effnum":
+        beta = 0.999
+        w = (1.0 - beta) / (1.0 - np.power(beta, counts))
+    else:
+        raise ValueError(f"unknown weight scheme: {scheme!r} "
+                         "(choose from inv|sqrt|log|effnum)")
     w = w / w.mean()
     return torch.tensor(w, dtype=torch.float32)
 

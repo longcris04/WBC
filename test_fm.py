@@ -1,22 +1,16 @@
-"""test.py — evaluate a trained run and log metrics (macro-F1 emphasized).
+"""test_fm.py — evaluate a trained foundation-model run and log metrics.
 
-Reads ``checkpoints/<name>/meta.json`` to recover the mode, model, image size
-and normalization stats, then:
+Identical evaluation logic to test.py (macro-F1 emphasized, per-fold + OOF for
+kfold, optional TTA); the only difference is that checkpoints are rebuilt with
+``model_fm.load_fm_checkpoint`` (encoder + adaptive head).
 
-  * ``holdout``  evaluate the single model on the validation set loaded from the
-    dataloader (phase2_eval).
-
-  * ``kfold``    evaluate every fold model on its own held-out validation fold,
-    with Test-Time Augmentation (TTA).  The predicted class is ``argmax`` of the
-    TTA-averaged softmax.  Per-fold macro-F1 is reported and aggregated by the
-    mean over folds; an overall out-of-fold (OOF) report is also produced.
-
-Every run is logged into a fresh folder ``<results-dir>/<name>/`` (``--name``).
+Reads ``checkpoints/<name>/meta.json`` to recover mode, model, image size and
+normalization, then writes a fresh report folder ``<results-dir>/<name>/``.
 
 Example
 -------
-    python test.py --name res50_holdout
-    python test.py --name cvx_k5 --tta on
+    python test_fm.py --name dinobloom_small_holdout
+    python test_fm.py --name phikon_kfold --tta on
 """
 from __future__ import annotations
 
@@ -26,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from sklearn.metrics import classification_report, f1_score
 
 from dataset import (
@@ -35,27 +28,11 @@ from dataset import (
     get_holdout_dfs, get_kfold_dfs,
 )
 from eval_viz import save_confusion_matrix
-from model import load_checkpoint, predict_probs
-
-
-def boost_ply_probs(probs, boost_ply):
-    """Post-hoc PLY boosting: multiply the PLY-class probability by
-    ``boost_ply`` and clip to 1.0, applied *before* argmax to trade a little
-    precision for higher PLY recall. A no-op when ``boost_ply == 1``.
-
-    Only the predicted class (argmax) reflects the boost; the probability CSV
-    still stores the raw model output. ``probs`` may be [C] or [N, C].
-    """
-    if boost_ply == 1:
-        return probs
-    probs = np.asarray(probs, dtype=np.float64).copy()
-    j = CLASS_TO_IDX["PLY"]
-    probs[..., j] = np.minimum(probs[..., j] * boost_ply, 1.0)
-    return probs
+from model_fm import load_fm_checkpoint, predict_probs
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate a trained WBC run")
+    p = argparse.ArgumentParser(description="Evaluate a trained WBC FM run")
     p.add_argument("--data-root", default="data")
     p.add_argument("--name", required=True, help="run name (checkpoints/<name>/)")
     p.add_argument("--ckpt-dir", default="checkpoints")
@@ -66,9 +43,6 @@ def parse_args():
     p.add_argument("--gpuid", type=int, default=0, help="GPU index cuda:0..7")
     p.add_argument("--tta", choices=["auto", "on", "off"], default="auto",
                    help="auto = on for kfold, off for holdout")
-    p.add_argument("--boost-ply", type=float, default=1.0,
-                   help="multiply the PLY-class probability by this factor "
-                        "(clipped to 1.0) before argmax; 1 = no change")
     return p.parse_args()
 
 
@@ -92,41 +66,21 @@ def _report(y_true, y_pred):
     return macro, txt, dct
 
 
-def save_probs_csv(ids, y_true, y_pred, probs, out_path):
-    """Save per-image softmax distributions to CSV.
-
-    Columns: ``ID``, ``label`` (true class name), ``pred`` (predicted class
-    name), then one column per class holding that class's probability.
-    Returns the written path as a string.
-    """
-    data = {
-        "ID": list(ids),
-        "label": [CLASSES[int(t)] for t in y_true],
-        "pred": [CLASSES[int(p)] for p in y_pred],
-    }
-    for c, cls in enumerate(CLASSES):
-        data[cls] = probs[:, c]
-    pd.DataFrame(data).to_csv(out_path, index=False)
-    print(f"Saved probabilities -> {out_path}")
-    return str(out_path)
-
-
 def evaluate_holdout(args, meta, device, use_tta, out_dir):
     _, val_df = get_holdout_dfs(args.data_root)
     tfm = build_transforms(meta["mean"], meta["std"], meta["img_size"], train=False)
     loader = make_loader(val_df, tfm, args.batch_size, shuffle=False,
                          num_workers=args.num_workers, has_labels=True)
 
-    model, _ = load_checkpoint(Path(args.ckpt_dir) / args.name / "holdout_best.pt",
-                               map_location=device)
+    model, _ = load_fm_checkpoint(Path(args.ckpt_dir) / args.name / "holdout_best.pt",
+                                  map_location=device)
     probs, ids = predict_probs(model, loader, device, tta=use_tta)
     id2true = dict(zip(val_df["ID"], val_df["labels"].map(CLASS_TO_IDX)))
     y_true = np.array([id2true[i] for i in ids])
-    y_pred = boost_ply_probs(probs, args.boost_ply).argmax(axis=1)
+    y_pred = probs.argmax(axis=1)
 
     macro, txt, dct = _report(y_true, y_pred)
-    print(f"\n=== Holdout eval (phase2_eval, TTA={use_tta}, "
-          f"boost_ply={args.boost_ply}) ===")
+    print(f"\n=== Holdout eval (phase2_eval, TTA={use_tta}) ===")
     print(f">>> Macro-averaged F1 = {macro:.4f} <<<\n")
     print(txt)
 
@@ -134,12 +88,8 @@ def evaluate_holdout(args, meta, device, use_tta, out_dir):
     cm = save_confusion_matrix(
         y_true, y_pred, out_dir / "confusion_matrix.png",
         f"Confusion matrix — holdout (phase2_eval, TTA={use_tta})")
-    probs_csv = save_probs_csv(
-        ids, y_true, y_pred, probs,
-        out_dir / f"probs_{meta['model_name']}_holdout.csv")
     return {"mode": "holdout", "tta": use_tta, "n_val": int(len(y_true)),
-            "macro_f1": float(macro), "report": dct, "confusion_matrix": cm,
-            "probs_csv": probs_csv}
+            "macro_f1": float(macro), "report": dct, "confusion_matrix": cm}
 
 
 def evaluate_kfold(args, meta, device, use_tta, out_dir):
@@ -151,33 +101,28 @@ def evaluate_kfold(args, meta, device, use_tta, out_dir):
     oof_true, oof_pred = [], []
     for i, (_tr_df, va_df) in enumerate(folds):
         ckpt = Path(args.ckpt_dir) / args.name / f"fold{i}_best.pt"
-        model, _ = load_checkpoint(ckpt, map_location=device)
+        model, _ = load_fm_checkpoint(ckpt, map_location=device)
         loader = make_loader(va_df, tfm, args.batch_size, shuffle=False,
                              num_workers=args.num_workers, has_labels=True)
         probs, ids = predict_probs(model, loader, device, tta=use_tta)
 
         id2true = dict(zip(va_df["ID"], va_df["labels"].map(CLASS_TO_IDX)))
         y_true = np.array([id2true[i_] for i_ in ids])
-        # argmax of the (optionally PLY-boosted) TTA-averaged softmax
-        y_pred = boost_ply_probs(probs, args.boost_ply).argmax(axis=1)
+        y_pred = probs.argmax(axis=1)      # argmax of TTA-averaged softmax
 
         macro, txt, dct = _report(y_true, y_pred)
         cm = save_confusion_matrix(
             y_true, y_pred, out_dir / f"fold{i}_confusion_matrix.png",
             f"Confusion matrix — fold {i} (TTA={use_tta})")
-        probs_csv = save_probs_csv(
-            ids, y_true, y_pred, probs,
-            out_dir / f"probs_{meta['model_name']}_fold{i}.csv")
         fold_f1.append(float(macro))
         fold_records.append({"fold": i, "n_val": int(len(y_true)),
                              "macro_f1": float(macro), "report": dct,
-                             "confusion_matrix": cm, "probs_csv": probs_csv})
+                             "confusion_matrix": cm})
         oof_true.append(y_true)
         oof_pred.append(y_pred)
         print(f"[fold {i}] macro-F1 = {macro:.4f}  (n={len(y_true)})")
         (out_dir / f"fold{i}_report.txt").write_text(txt, encoding="utf-8")
 
-    # aggregate: average score of the eval sets across all folds
     mean_f1, std_f1 = float(np.mean(fold_f1)), float(np.std(fold_f1))
     oof_true = np.concatenate(oof_true)
     oof_pred = np.concatenate(oof_pred)
@@ -213,7 +158,7 @@ def main():
     out_dir = Path(args.results_dir) / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device} | run: {args.name} | mode: {meta['mode']} "
-          f"| TTA: {use_tta} | boost_ply: {args.boost_ply}\nLogging to: {out_dir}")
+          f"| TTA: {use_tta}\nLogging to: {out_dir}")
 
     if meta["mode"] == "holdout":
         result = evaluate_holdout(args, meta, device, use_tta, out_dir)
@@ -221,7 +166,7 @@ def main():
         result = evaluate_kfold(args, meta, device, use_tta, out_dir)
 
     result["run_name"] = args.name
-    result["boost_ply"] = args.boost_ply
+    result["is_fm"] = True
     result["timestamp"] = datetime.now().isoformat(timespec="seconds")
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)

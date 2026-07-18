@@ -1,19 +1,33 @@
-"""train.py — train a WBC classifier in one of two modes.
+"""train_fm.py — train a foundation-model WBC classifier (encoder + small head).
+
+Same two modes as train.py:
 
   * ``--mode holdout``  train on (phase1_train + phase2_train), validate on
     phase2_eval.  A single best checkpoint ``holdout_best.pt`` is saved.
 
-  * ``--mode kfold``    stratified K-fold cross-validation over all labeled
-    data (phase1_train + phase2_train + phase2_eval).  One checkpoint per fold
-    ``fold{i}_best.pt`` is saved.
+  * ``--mode kfold``    stratified K-fold CV over all labeled data.  One
+    checkpoint per fold ``fold{i}_best.pt`` is saved.
 
-Everything a downstream script needs (model name, image size, per-channel
-mean/std, class list, fold layout) is written to ``checkpoints/<name>/meta.json``.
+Differences vs the baseline train.py
+-------------------------------------
+  * The backbone is a medical / white-blood-cell **foundation model** (see
+    ``model_fm.FM_ZOO``) used as an encoder, with a small trainable adaptive
+    head on top (``--head {linear,mlp}``).
+  * ``--freeze-encoder`` trains only the head (linear probe); otherwise the
+    encoder is fine-tuned with a smaller LR (``--encoder-lr``, default lr/10).
+  * ``--stats fm`` (default) uses the encoder's *native* normalization
+    (mean/std from its pretrained config) instead of dataset statistics.
+
+Everything a downstream script needs (model name, head config, image size,
+mean/std, class list, fold layout) is written to
+``checkpoints/<name>/meta.json``.
 
 Example
 -------
-    python train.py --mode holdout --model resnet50 --name res50_holdout --epochs 20
-    python train.py --mode kfold --k 5 --model convnext_tiny --name cvx_k5 --epochs 15
+    python train_fm.py --mode holdout --model dinobloom_small \
+        --name dinobloom_small_holdout --epochs 15 --amp
+    python train_fm.py --mode kfold --k 5 --model phikon \
+        --name phikon_kfold --epochs 12 --amp --freeze-encoder
 """
 from __future__ import annotations
 
@@ -30,25 +44,10 @@ from sklearn.metrics import f1_score
 from torch.amp import autocast, GradScaler
 
 try:
-    from tqdm import tqdm as _tqdm
+    from tqdm import tqdm
 except Exception:                       # tqdm optional
-    _tqdm = None
-
-# tqdm progress bars should animate ONLY on an interactive terminal, never in a
-# redirected/piped log file. We render bars straight to the controlling terminal
-# (/dev/tty) so that even when stdout+stderr are teed into a .log the bars stay
-# out of it, and the log carries only the per-epoch print() lines. When there is
-# no controlling terminal (background run, nohup, CI) the bars are disabled.
-try:
-    _TTY = open("/dev/tty", "w")
-except OSError:
-    _TTY = None
-
-
-def pbar(iterable, **kw):
-    if _tqdm is None or _TTY is None:
-        return iterable
-    return _tqdm(iterable, file=_TTY, **kw)
+    def tqdm(x, **k):
+        return x
 
 from dataset import (
     CLASSES, NUM_CLASSES, IMAGENET_MEAN, IMAGENET_STD,
@@ -56,11 +55,11 @@ from dataset import (
     make_loader, compute_class_weights, make_weighted_sampler,
     get_holdout_dfs, get_kfold_dfs, get_kfold_pool,
 )
-from model import build_model, save_checkpoint
+from model_fm import build_fm_model, save_fm_checkpoint, fm_norm_stats
 
 
 # --------------------------------------------------------------------------- #
-# Losses
+# Focal loss (parallels train.py:FocalLoss)
 # --------------------------------------------------------------------------- #
 class FocalLoss(nn.Module):
     """Multi-class focal loss (Lin et al., 2017) with optional per-class weight.
@@ -93,21 +92,32 @@ class FocalLoss(nn.Module):
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_args():
-    p = argparse.ArgumentParser(description="Train WBC classifier")
+    p = argparse.ArgumentParser(description="Train WBC foundation-model classifier")
     p.add_argument("--data-root", default="data")
     p.add_argument("--mode", choices=["holdout", "kfold"], default="holdout")
     p.add_argument("--k", type=int, default=5, help="number of folds (kfold mode)")
     p.add_argument("--name", required=True, help="run name -> checkpoints/<name>/")
     p.add_argument("--ckpt-dir", default="checkpoints")
 
-    p.add_argument("--model", default="resnet50")
-    p.add_argument("--no-pretrained", action="store_true")
+    # --- foundation model / head ---
+    p.add_argument("--model", default="dinobloom_small",
+                   help="alias in model_fm.FM_ZOO (or an 'hf-hub:...' id)")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="do NOT load the foundation-model weights (debug only)")
     p.add_argument("--img-size", type=int, default=224)
-    p.add_argument("--drop-rate", type=float, default=0.0)
+    p.add_argument("--head", choices=["linear", "mlp"], default="linear")
+    p.add_argument("--hidden-dim", type=int, default=512,
+                   help="hidden width of the MLP head (ignored for linear)")
+    p.add_argument("--drop-rate", type=float, default=0.0,
+                   help="dropout in the adaptive head")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="freeze encoder, train only the head (linear probe)")
 
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=3e-4, help="head learning rate")
+    p.add_argument("--encoder-lr", type=float, default=None,
+                   help="encoder LR when fine-tuning (default: lr/10)")
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--loss", choices=["ce", "focal"], default="ce",
@@ -125,16 +135,32 @@ def parse_args():
 
     # imbalance handling
     p.add_argument("--class-weights", action="store_true",
-                   help="weighted CrossEntropy (weighting set by --weight-scheme)")
+                   help="weighted loss (weighting set by --weight-scheme)")
     p.add_argument("--weight-scheme", choices=["inv", "sqrt", "log", "effnum"],
                    default="inv",
                    help="class-weight formula when --class-weights is set")
     p.add_argument("--sampler", choices=["none", "weighted"], default="none")
 
-    # normalization stats
-    p.add_argument("--stats", choices=["train", "imagenet"], default="train")
+    # normalization stats: fm = encoder's native mean/std (recommended)
+    p.add_argument("--stats", choices=["fm", "train", "imagenet"], default="fm")
     p.add_argument("--stats-max-images", type=int, default=3000)
     return p.parse_args()
+
+
+# --------------------------------------------------------------------------- #
+# Optimizer with separate encoder / head learning rates
+# --------------------------------------------------------------------------- #
+def build_optimizer(model, args):
+    if args.freeze_encoder:
+        return torch.optim.AdamW(
+            [p for p in model.head.parameters()],
+            lr=args.lr, weight_decay=args.weight_decay)
+    enc_lr = args.encoder_lr if args.encoder_lr is not None else args.lr * 0.1
+    groups = [
+        {"params": list(model.encoder.parameters()), "lr": enc_lr},
+        {"params": list(model.head.parameters()), "lr": args.lr},
+    ]
+    return torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
 
 
 # --------------------------------------------------------------------------- #
@@ -143,7 +169,7 @@ def parse_args():
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler, use_amp):
     model.train()
     running = 0.0
-    for imgs, labels, _ in pbar(loader, desc="train", leave=False):
+    for imgs, labels, _ in tqdm(loader, desc="train", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -162,7 +188,7 @@ def evaluate(model, loader, criterion, device):
     model.eval()
     running = 0.0
     preds, targets = [], []
-    for imgs, labels, _ in pbar(loader, desc="val", leave=False):
+    for imgs, labels, _ in tqdm(loader, desc="val", leave=False):
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         logits = model(imgs)
@@ -177,7 +203,7 @@ def evaluate(model, loader, criterion, device):
 
 
 def run_training(train_df, val_df, args, mean, std, device, ckpt_path, tag=""):
-    """Train one model; save the best (val macro-F1) checkpoint. Returns best F1."""
+    """Train one FM model; save the best (val macro-F1) checkpoint. Returns best F1."""
     tfm_train = build_transforms(mean, std, args.img_size, train=True)
     tfm_eval = build_transforms(mean, std, args.img_size, train=False)
 
@@ -189,9 +215,17 @@ def run_training(train_df, val_df, args, mean, std, device, ckpt_path, tag=""):
                              shuffle=False, num_workers=args.num_workers,
                              has_labels=True)
 
-    model = build_model(args.model, num_classes=NUM_CLASSES,
-                        pretrained=not args.no_pretrained,
-                        drop_rate=args.drop_rate).to(device)
+    model = build_fm_model(args.model, num_classes=NUM_CLASSES,
+                           pretrained=not args.no_pretrained,
+                           img_size=args.img_size, head=args.head,
+                           hidden_dim=args.hidden_dim, drop_rate=args.drop_rate,
+                           freeze_encoder=args.freeze_encoder).to(device)
+
+    n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_all = sum(p.numel() for p in model.parameters())
+    print(f"[{tag}] {args.model} | head={args.head} "
+          f"| freeze_encoder={args.freeze_encoder} "
+          f"| trainable {n_tr/1e6:.2f}M / {n_all/1e6:.2f}M params")
 
     weight = (compute_class_weights(train_df, scheme=args.weight_scheme).to(device)
               if args.class_weights else None)
@@ -201,8 +235,7 @@ def run_training(train_df, val_df, args, mean, std, device, ckpt_path, tag=""):
     else:
         criterion = nn.CrossEntropyLoss(weight=weight,
                                         label_smoothing=args.label_smoothing)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     use_amp = args.amp and device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
@@ -211,7 +244,10 @@ def run_training(train_df, val_df, args, mean, std, device, ckpt_path, tag=""):
     meta = {
         "model_name": args.model, "num_classes": NUM_CLASSES, "classes": CLASSES,
         "img_size": args.img_size, "mean": mean, "std": std,
+        "head": args.head, "hidden_dim": args.hidden_dim,
+        "freeze_encoder": args.freeze_encoder,
         "mode": args.mode, "k": args.k, "seed": args.seed, "tag": tag,
+        "is_fm": True,
     }
 
     for epoch in range(1, args.epochs + 1):
@@ -224,21 +260,21 @@ def run_training(train_df, val_df, args, mean, std, device, ckpt_path, tag=""):
         marker = ""
         if val_f1 > best_f1:
             best_f1, best_epoch, patience = val_f1, epoch, 0
-            save_checkpoint(ckpt_path, model, {**meta, "best_f1": best_f1,
-                                               "best_epoch": epoch})
+            save_fm_checkpoint(ckpt_path, model, {**meta, "best_f1": best_f1,
+                                                  "best_epoch": epoch})
             marker = "  *best*"
         else:
             patience += 1
         print(f"[{tag}] epoch {epoch:02d}/{args.epochs} "
               f"| train_loss {tr_loss:.4f} | val_loss {val_loss:.4f} "
-              f"| val_macroF1 {val_f1:.4f} | {dt:.0f}s{marker}", flush=True)
+              f"| val_macroF1 {val_f1:.4f} | {dt:.0f}s{marker}")
         if args.patience > 0 and patience >= args.patience:
             print(f"[{tag}] early stop at epoch {epoch} "
-                  f"(best macroF1 {best_f1:.4f} @ epoch {best_epoch})", flush=True)
+                  f"(best macroF1 {best_f1:.4f} @ epoch {best_epoch})")
             break
 
     print(f"[{tag}] BEST val macro-F1 = {best_f1:.4f} (epoch {best_epoch}) "
-          f"-> {ckpt_path}", flush=True)
+          f"-> {ckpt_path}")
     return best_f1
 
 
@@ -246,6 +282,11 @@ def run_training(train_df, val_df, args, mean, std, device, ckpt_path, tag=""):
 # Main
 # --------------------------------------------------------------------------- #
 def resolve_stats(args, df):
+    if args.stats == "fm":
+        mean, std = fm_norm_stats(args.model)
+        print(f"Using foundation-model native normalization: "
+              f"mean={np.round(mean, 4).tolist()} std={np.round(std, 4).tolist()}")
+        return mean, std
     if args.stats == "imagenet":
         print("Using ImageNet normalization stats.")
         return list(IMAGENET_MEAN), list(IMAGENET_STD)
@@ -262,12 +303,14 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device, args.gpuid)
-    print(f"Device: {device} | mode: {args.mode} | model: {args.model}")
+    print(f"Device: {device} | mode: {args.mode} | FM: {args.model}")
 
     run_dir = Path(args.ckpt_dir) / args.name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = {"mode": args.mode, "model_name": args.model,
+    summary = {"mode": args.mode, "model_name": args.model, "is_fm": True,
+               "head": args.head, "hidden_dim": args.hidden_dim,
+               "freeze_encoder": args.freeze_encoder,
                "img_size": args.img_size, "num_classes": NUM_CLASSES,
                "classes": CLASSES, "seed": args.seed, "args": vars(args)}
 
@@ -281,7 +324,6 @@ def main():
         summary["val_f1"] = best_f1
 
     else:  # kfold
-        # stats computed once over the whole labeled pool (stable across folds)
         pool = get_kfold_pool(args.data_root)
         mean, std = resolve_stats(args, pool)
         summary["mean"], summary["std"], summary["k"] = mean, std, args.k

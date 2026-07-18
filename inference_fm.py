@@ -1,19 +1,16 @@
-"""inference.py — predict phase2_test and write a Kaggle submission.
+"""inference_fm.py — predict phase2_test with a foundation-model run and write a
+Kaggle submission.
 
-  * ``holdout``  single trained model -> argmax of softmax.
+Identical inference logic to inference.py (holdout = argmax of softmax; kfold =
+majority vote of the fold models, tie-break by summed probability), except that
+checkpoints are rebuilt with ``model_fm.load_fm_checkpoint``.
 
-  * ``kfold``    the K fold models are combined by MAJORITY VOTING of their
-    per-model argmax predictions.  Ties are broken by the highest summed
-    probability across models.
-
-The submission preserves the exact ID order/format of ``phase2_test.csv``
-(columns ``ID,labels`` with ``labels`` filled by the predicted class code, e.g.
-``SNE``).
+The submission preserves the exact ID order/format of ``phase2_test.csv``.
 
 Example
 -------
-    python inference.py --name res50_holdout --out submission_res50.csv
-    python inference.py --name cvx_k5 --tta on --out submission_cvx_k5.csv
+    python inference_fm.py --name dinobloom_small_holdout --out submission_db_s.csv
+    python inference_fm.py --name phikon_kfold --tta on --out submission_phikon.csv
 """
 from __future__ import annotations
 
@@ -26,27 +23,14 @@ import numpy as np
 import pandas as pd
 
 from dataset import (
-    CLASS_TO_IDX, IDX_TO_CLASS, NUM_CLASSES, TEST_SPLIT, SPLIT_CONFIG,
+    IDX_TO_CLASS, NUM_CLASSES, TEST_SPLIT, SPLIT_CONFIG,
     set_seed, resolve_device, build_transforms, make_loader, get_test_df,
 )
-from model import load_checkpoint, predict_probs
-
-
-def boost_ply_probs(probs, boost_ply):
-    """Multiply the PLY-class probability by ``boost_ply`` and clip to 1.0
-    before argmax / voting. A no-op when ``boost_ply == 1``. ``probs`` may be a
-    single [C] vector or a [N, C] batch.
-    """
-    if boost_ply == 1:
-        return probs
-    probs = np.asarray(probs, dtype=np.float64).copy()
-    j = CLASS_TO_IDX["PLY"]
-    probs[..., j] = np.minimum(probs[..., j] * boost_ply, 1.0)
-    return probs
+from model_fm import load_fm_checkpoint, predict_probs
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Inference -> Kaggle submission")
+    p = argparse.ArgumentParser(description="FM inference -> Kaggle submission")
     p.add_argument("--data-root", default="data")
     p.add_argument("--name", required=True, help="run name (checkpoints/<name>/)")
     p.add_argument("--ckpt-dir", default="checkpoints")
@@ -60,9 +44,6 @@ def parse_args():
                    help="kfold aggregation: hard = majority vote of per-fold "
                         "argmax (tie-break by summed prob); soft = argmax of "
                         "the mean softmax over folds")
-    p.add_argument("--boost-ply", type=float, default=1.0,
-                   help="multiply the PLY-class probability by this factor "
-                        "(clipped to 1.0) before argmax/voting; 1 = no change")
     p.add_argument("--out", default=None, help="submission csv path")
     return p.parse_args()
 
@@ -95,10 +76,9 @@ def soft_vote(probsum_by_id, ids):
 
 
 def infer_holdout(args, meta, device, use_tta, loader, test_ids):
-    model, _ = load_checkpoint(Path(args.ckpt_dir) / args.name / "holdout_best.pt",
-                               map_location=device)
+    model, _ = load_fm_checkpoint(Path(args.ckpt_dir) / args.name / "holdout_best.pt",
+                                  map_location=device)
     probs, ids = predict_probs(model, loader, device, tta=use_tta)
-    probs = boost_ply_probs(probs, args.boost_ply)
     id2prob = dict(zip(ids, probs))
     return {i: int(np.argmax(id2prob[i])) for i in test_ids}
 
@@ -109,9 +89,8 @@ def infer_kfold(args, meta, device, use_tta, loader, test_ids):
     probsum = defaultdict(lambda: np.zeros(NUM_CLASSES, dtype=np.float64))
     for i in range(k):
         ckpt = Path(args.ckpt_dir) / args.name / f"fold{i}_best.pt"
-        model, _ = load_checkpoint(ckpt, map_location=device)
+        model, _ = load_fm_checkpoint(ckpt, map_location=device)
         probs, ids = predict_probs(model, loader, device, tta=use_tta)
-        probs = boost_ply_probs(probs, args.boost_ply)
         for _id, p in zip(ids, probs):
             votes[_id].append(int(np.argmax(p)))
             probsum[_id] += p
@@ -132,9 +111,8 @@ def main():
     use_tta = resolve_tta(args.tta, meta["mode"])
     vote_info = f" | vote: {args.vote}" if meta["mode"] == "kfold" else ""
     print(f"Device: {device} | run: {args.name} | mode: {meta['mode']} "
-          f"| TTA: {use_tta}{vote_info} | boost_ply: {args.boost_ply}")
+          f"| TTA: {use_tta}{vote_info}")
 
-    # test loader (unlabeled, deterministic order)
     test_df = get_test_df(args.data_root)
     tfm = build_transforms(meta["mean"], meta["std"], meta["img_size"], train=False)
     loader = make_loader(test_df, tfm, args.batch_size, shuffle=False,
@@ -146,7 +124,6 @@ def main():
     else:
         preds = infer_kfold(args, meta, device, use_tta, loader, test_ids)
 
-    # build submission in the ORIGINAL phase2_test.csv order/format
     test_csv = pd.read_csv(Path(args.data_root) / SPLIT_CONFIG[TEST_SPLIT][0],
                            usecols=lambda c: c in ("ID", "labels"))
     if "labels" not in test_csv.columns:
@@ -158,6 +135,7 @@ def main():
         print(f"WARNING: {missing} test IDs have no prediction!")
 
     out = args.out or f"submission_{args.name}.csv"
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     test_csv[["ID", "labels"]].to_csv(out, index=False)
     print(f"\nWrote submission ({len(test_csv)} rows) -> {out}")
     print("Class distribution:\n",
